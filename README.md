@@ -1,5 +1,6 @@
 <div align="center">
 <h1>Diffusion Refiner using VGGT</h1>
+</div>
 
 ## Overview
 For novel view synthesis, we render the VGGT point cloud into the target view. A diffusion model is then employed to refine the resulting sparse images into high-quality renderings.
