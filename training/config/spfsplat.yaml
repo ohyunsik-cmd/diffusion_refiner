@@ -1,0 +1,128 @@
+# Config for SPFSplatV2 dataset with VGGT training
+defaults:
+  - default_dataset
+
+exp_name: spfsplat_re10k
+img_size: 352
+num_workers: 4
+seed_value: 42
+accum_steps: 2
+patch_size: 14
+val_epoch_freq: 5
+max_img_per_gpu: 48
+
+limit_train_batches: 800
+limit_val_batches: 400
+
+
+data:
+  train:
+    _target_: vggt.data.spfsplat_datamodule.SPFSplatDataModule
+    roots:
+      - /mnt/hdd1/ACID/acid
+    batch_size: 4
+    num_workers: 4
+    num_context_views: 2
+    num_target_views: 1
+    max_distance_between_context_views: 150
+  val:
+    _target_: vggt.data.spfsplat_datamodule.SPFSplatDataModule
+    roots:
+      - /mnt/hdd1/ACID/acid
+    batch_size: 4
+    num_workers: 4
+    num_context_views: 2
+    num_target_views: 1
+    max_distance_between_context_views: 150
+
+
+logging:
+  log_dir: logs/spfsplat
+  log_visuals: False
+  log_freq: 1
+  log_level_primary: DEBUG
+  log_level_secondary: WARNING
+  all_ranks: False
+  tensorboard_writer:
+    _target_: train_utils.tb_writer.TensorBoardLogger
+    path: ${logging.log_dir}/tensorboard
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+    val:
+      keys_to_log:
+        - loss_objective
+
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+  save_freq: 5
+  resume_checkpoint_path: null
+  strict: False
+
+
+loss:
+  _target_: loss.MultitaskLoss
+  camera: 
+    weight: 5.0
+    loss_type: "l1"
+  depth:
+    weight: 1.0
+    gradient_loss_fn: "grad" 
+    valid_range: 0.98
+
+
+optim:
+  param_group_modifiers: False
+
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 5e-5
+    weight_decay: 0.05
+
+  frozen_module_names: []  # VGGT doesn't need freezing for this task
+
+  amp:
+    enabled: True
+    amp_dtype: bfloat16
+  gradient_clip: null  # Disable for initial testing
+  options:
+    lr:
+      - scheduler:
+          _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+          schedulers:
+            - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+              start_value: 1e-8
+              end_value: 5e-5
+            - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+              start_value: 5e-5
+              end_value: 1e-8
+          lengths: [0.05, 0.95]
+          interval_scaling: ['rescaled', 'rescaled']
+
+
+
+max_epochs: 20
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  enable_camera: True
+  enable_depth: True
+  enable_point: False
+  enable_track: False
+
+
+distributed:
+  backend: nccl
+  comms_dtype: None
+  find_unused_parameters: False
+  timeout_mins: 30
+  gradient_as_bucket_view: True
+  bucket_cap_mb: 25
+  broadcast_buffers: True
+
+cuda:
+    cudnn_deterministic: False
+    cudnn_benchmark: False
+    allow_tf32: True

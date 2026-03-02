@@ -1,0 +1,11 @@
+torch
+torchvision
+numpy
+pillow
+tqdm
+wandb
+diffusers
+peft
+lpips
+scikit-image
+einops
