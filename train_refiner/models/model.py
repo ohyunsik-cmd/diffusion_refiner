@@ -233,6 +233,9 @@ class Difix(torch.nn.Module):
             print("  unexpected examples:", unexpected[:20])
         if len(missing) > 0:
             print("  missing examples:", missing[:20])
+            
+        unet_lora_config = LoraConfig(r=4, init_lora_weights="gaussian", target_modules=["to_k", "to_q", "to_v", "to_out.0"])
+        unet.add_adapter(unet_lora_config, adapter_name="unet_lora")    
         
         # print number of trainable parameters
         print("="*50)
