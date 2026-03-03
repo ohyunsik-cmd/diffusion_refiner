@@ -13,7 +13,9 @@ First, clone this repository to your local machine, and install the dependencies
 ```bash
 git clone git@https://github.com/ohyunsik-cmd/diffusion_refiner
 cd diffusion_refiner
-pip install -r requirements_full.txt
+conda create -n vggt python=3.10 -y
+conda activate vggt
+pip install -r requirements.txt
 ```
 
 ## Dataset folder
