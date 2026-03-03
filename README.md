@@ -13,8 +13,8 @@ First, clone this repository to your local machine, and install the dependencies
 ```bash
 git clone git@https://github.com/ohyunsik-cmd/diffusion_refiner
 cd diffusion_refiner
-conda create -n vggt python=3.10 -y
-conda activate vggt
+conda create -n refiner python=3.10 -y
+conda activate refiner
 pip install -r requirements.txt
 ```
 
