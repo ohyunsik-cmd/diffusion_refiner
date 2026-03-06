@@ -15,7 +15,7 @@ git clone git@https://github.com/ohyunsik-cmd/diffusion_refiner
 cd diffusion_refiner
 conda create -n refiner python=3.10 -y
 conda activate refiner
-pip install -r requirements.txt
+conda env create -f environment.yml
 ```
 
 ## Dataset folder
@@ -40,7 +40,7 @@ The Difix3D+ model fine-tunes the SD-Turbo model into a refiner. The UNet was fu
 
 An example command to train the model is:
 ```
-CUDA_VISIBLE_DEVICES=2 accelerate launch --mixed_precision=bf16 train_difix.py \
+CUDA_VISIBLE_DEVICES=0 accelerate launch --mixed_precision=bf16 train_difix.py \
   --output_dir ./outputs/difix_train \
   --tracker_project_name difix \
   --tracker_run_name difix_re10k_bf16 \
