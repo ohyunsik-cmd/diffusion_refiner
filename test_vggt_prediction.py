@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri, extri_intri_to_pose_encoding
 from data.crop_shim import rescale_and_crop
+from train_refiner.render.zbuffer import render_pointcloud_zbuffer
 
 # =========================
 # Config
@@ -384,100 +385,51 @@ def select_views(num_views, min_gap=50, max_gap=150):
     target = np.random.randint(left + 1, right)
     return [left, right], target
 
-# =========================
-# Render: vectorized z-buffer (near-first)
-# =========================
-def render_pointcloud_zbuffer(pts_world: torch.Tensor, rgb: torch.Tensor, w2c_tgt: torch.Tensor, K_tgt: torch.Tensor, H: int, W: int):
-    """
-    pts_world: [N,3]  (in Pred/VGGT world)
-    rgb:       [N,3]  (0..1)
-    w2c_tgt:   [3,4]  (world->cam)
-    K_tgt:     [3,3]
-    returns rendered [3,H,W]
-    """
+# ==========================================================
+# 🔍 렌더링 함수 문제인지 확인하기 위한 순수 PyTorch 렌더러
+# ==========================================================
+def simple_point_splatting(pts, cols, w2c, K, H, W):
+    # 1. World -> Camera 변환
+    R = w2c[:3, :3]
+    t = w2c[:3, 3]
+    cam_pts = pts @ R.T + t
     
-    def camera_center_from_w2c(w2c: torch.Tensor):
-        R = w2c[:3,:3]
-        t = w2c[:3,3]
-        C = -R.transpose(0,1) @ t
-        return C
-
-    C = camera_center_from_w2c(w2c_tgt)
-    print("C:", C.tolist(), "||C||:", float(C.norm()))
-
-    R = w2c_tgt[:3, :3]
-    t = w2c_tgt[:3, 3]
-
-    cam = pts_world @ R.transpose(0, 1) + t  # row-vector: Xcam = Xw R^T + t
-    z = cam[:, 2]
-    valid = z > 1e-6  # z가 너무 작으면 수치적으로 불안정하므로 제거 (카메라 뒤에 있거나 너무 가까운 점)
-    zv = z[valid]
-
-    if zv.numel() > 64:
-        z_floor = torch.quantile(zv, 0.02).clamp(min=0.001)  # 데이터에 맞춰 0.2 유지
-    else:
-        z_floor = torch.tensor(0.001, device=z.device)
+    # 2. 카메라 뒤쪽에 있는 점(Z <= 0) 제거
+    valid = cam_pts[:, 2] > 0
+    cam_pts = cam_pts[valid]
+    valid_cols = cols[valid]
+    
+    # 3. K 매트릭스를 이용해 2D 픽셀 좌표로 투영 (OpenCV 기준)
+    z = cam_pts[:, 2]
+    x = (cam_pts[:, 0] / z) * K[0, 0] + K[0, 2]
+    y = (cam_pts[:, 1] / z) * K[1, 1] + K[1, 2]
+    
+    # 정수 픽셀 인덱스로 변환
+    x_idx = torch.round(x).long()
+    y_idx = torch.round(y).long()
+    
+    # 4. 이미지 화면 밖으로 벗어난 점 제거
+    in_img = (x_idx >= 0) & (x_idx < W) & (y_idx >= 0) & (y_idx < H)
+    x_idx = x_idx[in_img]
+    y_idx = y_idx[in_img]
+    valid_cols = valid_cols[in_img]
+    z = z[in_img]
+    
+    if len(z) == 0:
+        return torch.zeros((3, H, W), device=pts.device)
         
-    valid = valid & (z >= z_floor)
-    if valid.sum() < 10:
-        return torch.zeros((3, H, W), device=pts_world.device)
+    # 5. Z-버퍼(멀리 있는 점부터 먼저 칠해서 덮어쓰기)
+    sort_idx = torch.argsort(z, descending=True)
+    x_idx = x_idx[sort_idx]
+    y_idx = y_idx[sort_idx]
+    valid_cols = valid_cols[sort_idx]
     
-    cam_v = cam[valid]
-    z = cam_v[:, 2]
+    # 6. 빈 캔버스에 색상 채우기
+    img = torch.zeros((3, H, W), device=pts.device, dtype=valid_cols.dtype)
+    img[:, y_idx, x_idx] = valid_cols.T
     
-    x = cam_v[:, 0] / (z + 1e-8) * K_tgt[0, 0] + K_tgt[0, 2]
-    y = cam_v[:, 1] / (z + 1e-8) * K_tgt[1, 1] + K_tgt[1, 2]
-    
-    print("[render debug]",
-          "N=", pts_world.shape[0],
-          "z(min/mean/max)=", float(z.min()), float(z.mean()), float(z.max()),
-          "valid=", int(valid.sum()), "/", int(valid.numel()),
-          "x(min/max)=", float(x.min()), float(x.max()),
-          "y(min/max)=", float(y.min()), float(y.max()),
-          "rgb(min/max)=", float(rgb.min()), float(rgb.max()))
-    
-    if not valid.any():
-        return torch.zeros((3, H, W), device=pts_world.device)
-
-    in_img = (x >= 0) & (x < W) & (y >= 0) & (y < H)
-    if in_img.sum() < 10:
-        return torch.zeros((3, H, W), device=pts_world.device)
-
-    # 이 4개는 반드시 같은 길이(in_img)로 맞춘다
-    xv  = x[in_img]
-    yv  = y[in_img]
-    zv  = z[in_img].float()
-    cv  = rgb[valid][in_img].float()
-
-    # round는 xv/yv에서만 한다 (x/y 절대 쓰지 마)
-    x_i = torch.round(xv).long()
-    y_i = torch.round(yv).long()
-
-    # round 후 bounds check (이때 mask 길이 = len(x_i)=len(zv)=len(cv))
-    inb = (x_i >= 0) & (x_i < W) & (y_i >= 0) & (y_i < H)
-    if inb.sum() < 10:
-        return torch.zeros((3, H, W), device=pts_world.device)
-
-    x_i = x_i[inb]
-    y_i = y_i[inb]
-    z_i = zv[inb]
-    c_i = cv[inb]
-
-    flat = (y_i * W + x_i).long()
-
-    order = torch.argsort(z_i)  # near first
-    flat_s = flat[order]
-    col_s  = c_i[order]
-
-    keep = torch.ones_like(flat_s, dtype=torch.bool)
-    keep[1:] = flat_s[1:] != flat_s[:-1]
-
-    flat_k = flat_s[keep]
-    col_k  = col_s[keep]
-
-    out = torch.zeros((H * W, 3), device=pts_world.device, dtype=col_k.dtype)
-    out[flat_k] = col_k
-    return out.view(H, W, 3).permute(2, 0, 1)
+    return img
+# ==========================================================
 
 
 # =========================
@@ -489,7 +441,7 @@ print("Model loaded!")
 
 print("Loading samples from RE10K dataset...")
 
-for sample_num in range(10):
+for sample_num in range(50):
     chunk_idx = np.random.randint(0, 500)
     chunk_path = DATASET_ROOT / "train" / f"{chunk_idx:06d}.torch"
     data = load_chunk_sample(chunk_path, sample_idx=0)
@@ -520,7 +472,7 @@ for sample_num in range(10):
     K0 = K0[0,0].float()
     w2c0 = w2c0[0,0].float()
 
-    # 다시 encoding (같은 H,W로)
+    # 다시 encoding (같은 H,W로) 
     pose_back = extri_intri_to_pose_encoding(
         w2c0[None,None], K0[None,None], image_size_hw=(out_h,out_w)
     )[0,0]
@@ -601,10 +553,9 @@ for sample_num in range(10):
     
     w2c_pose, K_pose = pose_encoding_to_extri_intri(pred_pose["pose_enc"], (out_h, out_w), build_intrinsics=True)
     w2c_predT = w2c_pose[0,2].float()     # ✅ target pose (predicted)
-    K_predT   = K_pose[0,2].float()       # ✅ target intrinsics (predicted)
+    K_predT_raw   = K_pose[0,2].float()       # ✅ target intrinsics (predicted)
 
-    print("K_pred1: ", K_pred1)
-    print("k_pred0: ", K_pred0)
+    K_predT = apply_fxfy_scale(K_predT_raw, fx_scale, fy_scale)
     
     t = interp_ratio_from_gt_centers(w2c_gt0, w2c_gt1, w2c_gtT)
     K_tgt = interp_K_log(K_pred0, K_pred1, t)
@@ -651,8 +602,10 @@ for sample_num in range(10):
     print("K_GT target:", K_tgt)
 
     # 5) Render to target (GT->Pred transformed pose)
-    rendered = render_pointcloud_zbuffer(all_pts, all_col, w2c_tgt_in_pred, K_tgt, out_h, out_w)
-    rendered_from_predT = render_pointcloud_zbuffer(all_pts, all_col, w2c_predT, K_predT, out_h, out_w)
+    #rendered, mask= render_pointcloud_zbuffer(all_pts, all_col, w2c_tgt_in_pred, K_tgt, out_h, out_w)
+    #rendered_from_predT, mask = render_pointcloud_zbuffer(all_pts, all_col, w2c_predT, K_predT, out_h, out_w)
+    rendered = simple_point_splatting(all_pts, all_col, w2c_tgt_in_pred, K_tgt, out_h, out_w)
+    rendered_from_predT = simple_point_splatting(all_pts, all_col, w2c_predT, K_predT, out_h, out_w)
     
     img = rendered  # [3,H,W]
     filled = (img.sum(0, keepdim=True) > 0).float()  # [1,H,W]
@@ -665,6 +618,15 @@ for sample_num in range(10):
     out = img.clone()
     out[:, filled[0] == 0] = img2[:, filled[0] == 0]
     rendered = out
+    
+    img_pred = rendered_from_predT
+    filled_pred = (img_pred.sum(0, keepdim=True) > 0).float()
+    # Pred는 카메라가 가까워져 틈이 더 벌어질 수 있으니 커널을 5로 세팅
+    img2_pred = F.max_pool2d(img_pred.unsqueeze(0), kernel_size=3, stride=1, padding=1)[0]
+    
+    out_pred = img_pred.clone()
+    out_pred[:, filled_pred[0] == 0] = img2_pred[:, filled_pred[0] == 0]
+    rendered_from_predT = out_pred
 
     rendered_np = rendered.permute(1, 2, 0).detach().cpu().numpy().clip(0, 1)
     rendered_from_predT_np = rendered_from_predT.permute(1, 2, 0).detach().cpu().numpy().clip(0, 1)

@@ -33,7 +33,7 @@ def estimate_fxfy_from_reproj(w2c34: torch.Tensor, K: torch.Tensor,
     t = w2c34[:3, 3]
     cam = pts @ R.T + t
     z = cam[:, 2]
-    valid = z > 1e-6
+    valid = z > 0
     cam = cam[valid]
     xs = xs[valid].float()
     ys = ys[valid].float()

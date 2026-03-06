@@ -14,7 +14,7 @@ sys.path.append(p)
 from einops import rearrange, repeat
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
-
+from .sd_turbo_masked import SDTurboMaskedConvIn
 
 def make_1step_sched():
     noise_scheduler_1step = DDPMScheduler.from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
@@ -93,12 +93,32 @@ def load_ckpt_from_state_dict(net_difix, optimizer, pretrained_path):
         for k in sd["state_dict_vae"]:
             _sd_vae[k] = sd["state_dict_vae"][k]
         net_difix.vae.load_state_dict(_sd_vae)
-    _sd_unet = net_difix.unet.state_dict()
-    for k in sd["state_dict_unet"]:
-        _sd_unet[k] = sd["state_dict_unet"][k]
-    net_difix.unet.load_state_dict(_sd_unet)
         
-    optimizer.load_state_dict(sd["optimizer"])
+    _sd_unet = net_difix.unet.state_dict()
+    for k, v in sd["state_dict_unet"].items():
+        # ✨ 핵심: 기존 conv_in 키를 새로운 wrapper 내부의 conv1 키로 리다이렉트합니다.
+        target_key = k
+        if k == "conv_in.weight":
+            target_key = "conv_in.conv1.weight"
+        elif k == "conv_in.bias":
+            target_key = "conv_in.conv1.bias"
+        
+        # 모델에 실제 존재하는 키인 경우에만 가중치 대입
+        if target_key in _sd_unet:
+            _sd_unet[target_key] = v
+        else:
+            # 새로 추가한 conv1_mask는 이전 체크포인트에 없으므로 여기서 건너뛰게 됩니다.
+            print(f"Skipping key: {k} (mapping to {target_key} failed or not present)")
+    net_difix.unet.load_state_dict(_sd_unet, strict=False)
+    
+    try:
+        optimizer.load_state_dict(sd["optimizer"])
+        print("✅ Optimizer state loaded successfully.")
+    except (ValueError, KeyError, RuntimeError) as e:
+        # 새로운 레이어 추가로 파라미터 개수가 달라졌을 때 이쪽으로 들어옵니다.
+        print(f"⚠️ Optimizer state mismatch: {e}")
+        print("💡 Architecture changed (Mask Branch added). Skipping optimizer state load.")
+        print("💡 Training will proceed with fresh optimizer states for new layers.")
     
     return net_difix, optimizer
 
@@ -237,6 +257,8 @@ class Difix(torch.nn.Module):
         unet_lora_config = LoraConfig(r=4, init_lora_weights="gaussian", target_modules=["to_k", "to_q", "to_v", "to_out.0"])
         unet.add_adapter(unet_lora_config, adapter_name="unet_lora")    
         
+        unet.conv_in = SDTurboMaskedConvIn(unet.conv_in).cuda()
+        
         # print number of trainable parameters
         print("="*50)
         print(f"Number of trainable parameters in UNet: {sum(p.numel() for p in unet.parameters() if p.requires_grad) / 1e6:.2f}M")
@@ -265,8 +287,9 @@ class Difix(torch.nn.Module):
         self.vae.decoder.skip_conv_2.requires_grad_(True)
         self.vae.decoder.skip_conv_3.requires_grad_(True)
         self.vae.decoder.skip_conv_4.requires_grad_(True)
+        self.unet.conv_in.conv1_mask.requires_grad_(True)
 
-    def forward(self, x, timesteps=None, prompt=None, prompt_tokens=None):
+    def forward(self, x, mask=None, timesteps=None, prompt=None, prompt_tokens=None):
         # either the prompt or the prompt_tokens should be provided
         assert (prompt is None) != (prompt_tokens is None), "Either prompt or prompt_tokens should be provided"
         
@@ -282,6 +305,19 @@ class Difix(torch.nn.Module):
         x = rearrange(x, 'b v c h w -> (b v) c h w')
         z = self.vae.encode(x).latent_dist.sample() * self.vae.config.scaling_factor 
         caption_enc = repeat(caption_enc, 'b n c -> (b v) n c', v=num_views)
+        
+        if mask is not None:
+            import torch.nn.functional as F
+            # 마스크도 이미지처럼 [b, v, 1, h, w] -> [b*v, 1, h, w] 로 폅니다.
+            mask = rearrange(mask, 'b v c h w -> (b v) c h w')
+            
+            # Latent 크기(예: 42x42)에 맞게 줄입니다.
+            mask_latent = F.interpolate(mask, size=z.shape[-2:], mode="bilinear", align_corners=False)
+            
+            # UNet의 conv_in 모듈 안에 몰래 넣어둡니다.
+            self.unet.conv_in.current_mask = mask_latent
+        else:
+            self.unet.conv_in.current_mask = None
         
         self.sched.set_timesteps(1, device="cuda")
         t_fixed = self.sched.timesteps[0]

@@ -16,7 +16,7 @@ from ..util.align_camerapose import (
     interp_K_log,
     interp_ratio_from_gt_centers,
 )
-from ..render.zbuffer import render_pointcloud_zbuffer, dilation_fill
+from ..render.zbuffer import render_pointcloud_zbuffer
 
 
 # -------------------------
@@ -97,9 +97,6 @@ class VGGTWrapperCfg:
     conf_thresh: float = 0.1
     image_mask_thresh: float = 0.01
 
-    # postprocess
-    use_dilation_fill: bool = True
-
     # perf
     use_amp: bool = True   # only active on cuda
 
@@ -121,15 +118,17 @@ class VGGTWrapper:
         self.model = VGGT.from_pretrained(self.cfg.model_id).to(self.device).eval()
 
     @torch.no_grad()
-    def forward_context(self, context_images_b2chw: torch.Tensor) -> Dict[str, Any]:
+    def forward_context(self, context_images_b2chw: torch.Tensor, full_image_b3chw: torch.Tensor) -> Dict[str, Any]:
         """
         context_images_b2chw: [B,2,3,H,W] (usually B=1)
         """
         x = context_images_b2chw.to(self.device)
+        x_pred = full_image_b3chw.to(self.device)
         amp_ok = (self.device.type == "cuda") and self.cfg.use_amp
         with torch.cuda.amp.autocast(dtype=self.dtype, enabled=amp_ok):
             pred = self.model(x)
-        return pred
+            pred_pose = self.model(x_pred)
+        return pred, pred_pose
 
     @torch.no_grad()
     def render_novel_views(
@@ -152,21 +151,22 @@ class VGGTWrapper:
         target_index    = target_index.to(device).long()
 
         b_idx = torch.arange(B, device=device)
+        
+        context_images = images[b_idx[:, None], context_indices] # [B,2,3,H,W]
+        target_images = images[b_idx, target_index].unsqueeze(1)  # [B,1,3,H,W]
+        full_images = torch.cat([context_images, target_images], dim=1)  # [B,3,3,H,W]
 
-        # [B,2,3,H,W]
-        context_images = images[b_idx[:, None], context_indices]
-
-        # VGGT forward in batch (중요: 여기서 이득 제일 큼)
-        pred = self.forward_context(context_images)  # pred contains batch
+        # VGGT forward in batch 
+        pred, pred_pose = self.forward_context(context_images_b2chw=context_images, full_image_b3chw=full_images)  # pred contains batch
 
         # pose decode
-        pred_pose_enc = pred["pose_enc"]  # 보통 [B,2,...] 형태일 거야
+        pred_pose_enc = pred_pose["pose_enc"]  # 보통 [B,2,...] 형태일 거야
         pred_w2c, pred_K = pose_encoding_to_extri_intri(
             pred_pose_enc,
             (S, S),
             build_intrinsics=True,
         )  # w2c: [B,2,3,4], K: [B,2,3,3] (가정)
-
+        
         # world points
         wp   = pred["world_points"].float()       # [B,2,H,W,3] (가정)
         conf = pred["world_points_conf"].float()  # [B,2,H,W]
@@ -176,6 +176,7 @@ class VGGTWrapper:
         img_ctx = context_images.permute(0, 1, 3, 4, 2).float()
 
         rendered_out = torch.zeros((B, 3, S, S), device=device, dtype=torch.float32)
+        mask_out = torch.zeros((B, 1, S, S), device=device, dtype=torch.float32)
         valid = torch.zeros((B,), device=device, dtype=torch.bool)
 
         # target GT
@@ -184,8 +185,11 @@ class VGGTWrapper:
         for b in range(B):
             w2c_pred0 = pred_w2c[b, 0].float()
             w2c_pred1 = pred_w2c[b, 1].float()
+            w2c_pred_tgt = pred_w2c[b, 2].float()
             K_pred0 = pred_K[b, 0].float()
             K_pred1 = pred_K[b, 1].float()
+            K_pred_tgt = pred_K[b, 2].float()
+        
 
             wp0 = wp[b, 0]
             wp1 = wp[b, 1]
@@ -214,38 +218,26 @@ class VGGTWrapper:
 
             if pts0.numel() == 0 or pts1.numel() == 0:
                 continue
-
-            # fx/fy correction
+            
             fx_eff0, fy_eff0 = estimate_fxfy_from_reproj(w2c_pred0, K_pred0, wp0, m0)
             fx_eff1, fy_eff1 = estimate_fxfy_from_reproj(w2c_pred1, K_pred1, wp1, m1)
-
             fx_scale = float(0.5 * (fx_eff0 / K_pred0[0, 0] + fx_eff1 / K_pred1[0, 0]))
             fy_scale = float(0.5 * (fy_eff0 / K_pred0[1, 1] + fy_eff1 / K_pred1[1, 1]))
 
             all_pts = torch.cat([pts0, pts1], dim=0)
             all_col = torch.cat([col0, col1], dim=0)
 
-            # GT extrinsics for Sim(3)
-            gt_ctx0 = extri[b, context_indices[b, 0]][:3, :4].float()
-            gt_ctx1 = extri[b, context_indices[b, 1]][:3, :4].float()
-            gt_tgt  = extri[b, target_index[b]][:3, :4].float()
-
-            s, Rsim, tsim = estimate_sim3_gt_to_pred(gt_ctx0, gt_ctx1, w2c_pred0, w2c_pred1)
-            w2c_tgt_in_pred = transform_gt_w2c_to_pred_w2c(gt_tgt, s, Rsim, tsim).float()
-
             # intrinsics for target (interp + scale)
-            ratio = interp_ratio_from_gt_centers(gt_ctx0, gt_ctx1, gt_tgt)
-            K_tgt = interp_K_log(K_pred0, K_pred1, ratio)
-            K_tgt = apply_fxfy_scale(K_tgt, fx_scale, fy_scale)
+            K_tgt = apply_fxfy_scale(K_pred_tgt, fx_scale, fy_scale)
 
-            rendered = render_pointcloud_zbuffer(all_pts, all_col, w2c_tgt_in_pred, K_tgt, S, S)
-            if self.cfg.use_dilation_fill:
-                rendered = dilation_fill(rendered)  # or dilation_fill_batched(rendered.unsqueeze(0))[0]
+            rendered, mask = render_pointcloud_zbuffer(all_pts, all_col, w2c_pred_tgt, K_tgt, S, S)
 
             rendered_out[b] = rendered
+            mask_out[b] = mask.unsqueeze(0)
             valid[b] = True
 
         return {
+            "mask": mask_out,                 # [B,1,H,W]
             "rendered": rendered_out,     # [B,3,H,W]
             "target": target,             # [B,3,H,W]
             "context0": context_images[:, 0],  # [B,3,H,W]

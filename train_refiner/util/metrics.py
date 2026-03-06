@@ -48,7 +48,7 @@ def compute_batch_ssim(
     ssim = [
         structural_similarity(
             gt.detach().cpu().numpy(),
-            hat.detach().cpu().numpy(),
+            hat.detach().cpu().float().numpy(),
             win_size=11,
             gaussian_weights=True,
             channel_axis=0,

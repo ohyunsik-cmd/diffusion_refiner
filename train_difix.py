@@ -31,6 +31,7 @@ from train_refiner.models.model_wrapper import VGGTWrapper, VGGTWrapperCfg
 from train_refiner.data.re10k_dataset import RE10KDataset, build_chunk_index, make_index_cache_path
 from train_refiner.data.view_sampler import select_views
 from train_refiner.util.loss import gram_loss
+from train_refiner.util.metrics import compute_batch_psnr, compute_batch_ssim
 from train_refiner.conf import *
 
 from collections import defaultdict
@@ -163,6 +164,7 @@ def main(args):
         batch_size=args.train_batch_size,
         shuffle=True,
         num_workers=args.dataloader_num_workers,
+        pin_memory=True,
     )
 
     dataset_val = RE10KDataset(args.val_chunks, folder="test", precomputed_index=val_index)
@@ -172,8 +174,9 @@ def main(args):
         shuffle=False,
         num_workers=0,
     )
-
-    vggt_model = VGGTWrapper(VGGTWrapperCfg(conf_thresh=0.1, use_dilation_fill=True))
+    
+    #get the vggt model for rendering
+    vggt_model = VGGTWrapper(VGGTWrapperCfg(conf_thresh=0.1))
     
     # Resume from checkpoint
     global_step = 0    
@@ -253,10 +256,14 @@ def main(args):
 
                 rendered = render_result["rendered"]  # [B,3,H,W], 0..1
                 target   = render_result["target"]    # [B,3,H,W], 0..1
+                mask     = render_result["mask"]      # [B,1,H,W], 0..1 (렌더링이 잘 안된 영역이 1)
 
                 # Difix는 [-1,1] + view dim
                 x_src = (rendered * 2 - 1).unsqueeze(1).to(accelerator.device, dtype=weight_dtype)  # [B,1,3,H,W]
                 x_tgt = (target   * 2 - 1).unsqueeze(1).to(accelerator.device, dtype=weight_dtype)  # [B,1,3,H,W]
+                
+                H, W = 336, 336
+                x_mask = mask.view(B, 1, 1, H, W).to(accelerator.device, dtype=weight_dtype)
 
                 # prompt tokens: empty prompt를 B에 맞게
                 empty_tokens = accelerator.unwrap_model(net_difix).tokenizer(
@@ -268,11 +275,16 @@ def main(args):
                 ).input_ids.to(accelerator.device)
 
                 # forward
-                x_tgt_pred = net_difix(x_src, prompt_tokens=empty_tokens)  # [B,1,3,H,W]
+                x_tgt_pred = net_difix(x_src, mask = x_mask, prompt_tokens=empty_tokens)  # [B,1,3,H,W]
                 V = 1    
                 
                 x_tgt = rearrange(x_tgt, 'b v c h w -> (b v) c h w')
                 x_tgt_pred = rearrange(x_tgt_pred, 'b v c h w -> (b v) c h w')
+                         
+                # compute PSNR/SSIM before training step
+                with torch.no_grad():
+                    psnr_pred = float(compute_batch_psnr(x_tgt_pred, x_tgt).mean().item())
+                    ssim_pred = float(compute_batch_ssim(x_tgt_pred.detach().cpu(), x_tgt.detach().cpu()).mean().item())
                          
                 # Reconstruction loss
                 loss_l2 = F.mse_loss(x_tgt_pred.float(), x_tgt.float(), reduction="mean") * args.lambda_l2
@@ -284,7 +296,8 @@ def main(args):
                     if global_step > args.gram_loss_warmup_steps:
                         _, _, H, W = x_tgt_pred.shape
                         x_tgt_pred_renorm = t_vgg_renorm(x_tgt_pred * 0.5 + 0.5)
-                        crop_h, crop_w = 400, 400
+                        crop_h = min(H, 400)
+                        crop_w = min(W, 400)
                         top, left = random.randint(0, H - crop_h), random.randint(0, W - crop_w)
                         x_tgt_pred_renorm = crop(x_tgt_pred_renorm, top, left, crop_h, crop_w)
                         
@@ -318,7 +331,11 @@ def main(args):
                     logs["loss_lpips"] = loss_lpips.detach().item()
                     if args.lambda_gram > 0:
                         logs["loss_gram"] = loss_gram.detach().item()
+                    logs["lr"] = optimizer.param_groups[0]["lr"]
+                    logs["psnr_pred"] = psnr_pred
+                    logs["ssim_pred"] = ssim_pred
                     progress_bar.set_postfix(**logs)
+                    
 
                     # viz some images
                     if global_step % args.viz_freq == 1:
@@ -375,6 +392,10 @@ def main(args):
 
                                 pred_01 = (vx_pred[:,0] * 0.5 + 0.5).clamp(0,1)
                                 tgt_01  = target.clamp(0,1)
+                                
+                                psnr_pred = float(compute_batch_psnr(pred_01, tgt_01).item())
+                                ssim_pred = float(compute_batch_ssim(pred_01.detach().cpu(), tgt_01.detach().cpu()).item())
+                                
 
                                 loss_l2 = F.mse_loss(pred_01.float(), tgt_01.float(), reduction="mean")
                                 pred_m11 = pred_01 * 2 - 1
@@ -383,7 +404,8 @@ def main(args):
 
                                 l_l2.append(loss_l2.item())
                                 l_lpips.append(loss_lpips.item())
-
+                        logs["val/psnr"] = psnr_pred
+                        logs["val/ssim"] = ssim_pred
                         logs["val/l2"] = np.mean(l_l2)
                         logs["val/lpips"] = np.mean(l_lpips)
                         for k in log_dict:
@@ -399,7 +421,7 @@ if __name__ == "__main__":
     # args for the loss function
     parser.add_argument("--lambda_lpips", default=1.0, type=float)
     parser.add_argument("--lambda_l2", default=1.0, type=float)
-    parser.add_argument("--lambda_gram", default=1.0, type=float)
+    parser.add_argument("--lambda_gram", default=0.5, type=float)
     parser.add_argument("--gram_loss_warmup_steps", default=2000, type=int)
 
     # dataset options
@@ -446,7 +468,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--lr_power", type=float, default=1.0, help="Power factor of the polynomial scheduler.")
 
-    parser.add_argument("--dataloader_num_workers", type=int, default=0,)
+    parser.add_argument("--dataloader_num_workers", type=int, default=8,)
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
