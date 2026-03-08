@@ -1,34 +1,6 @@
 import torch
 import torch.nn.functional as F
 
-def compute_big_mask_from_hit(
-    hit: torch.Tensor,            # [H,W] bool
-    win: int = 31,                # 윈도우 크기 (홀수 권장)
-    min_fill_ratio: float = 0.15, # 윈도우 내 hit 비율이 이 이상이면 big으로
-    smooth_iters: int = 1,        # 1~2 정도로 다듬기
-):
-    """
-    빠른 근사 '큰 영역' 마스크:
-    - k×k 평균풀로 local density를 구하고
-    - density가 threshold 이상인 곳만 big으로 간주
-    """
-    H, W = hit.shape
-    x = hit.float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-
-    # local density
-    pad = win // 2
-    dens = F.avg_pool2d(x, kernel_size=win, stride=1, padding=pad)  # [1,1,H,W]
-    big = (dens[0, 0] >= min_fill_ratio)
-
-    # optional smoothing (팽창/침식 비슷한 효과)
-    # big이 끊기는 걸 줄이려고 maxpool로 살짝 연결해줌
-    for _ in range(smooth_iters):
-        big = (F.max_pool2d(big.float().unsqueeze(0).unsqueeze(0),
-                            kernel_size=3, stride=1, padding=1)[0, 0] > 0)
-
-    return big  # [H,W] bool
-
-
 def render_pointcloud_zbuffer(
     pts_world: torch.Tensor, rgb: torch.Tensor,
     w2c_tgt: torch.Tensor, K_tgt: torch.Tensor,
@@ -113,13 +85,6 @@ def render_pointcloud_zbuffer(
     out = out_flat.view(H, W, 3).permute(2, 0, 1)
     hit = hit_flat.view(H, W)
 
-    # big mask 계산 (hit 기반)
-    big = compute_big_mask_from_hit(
-        hit, win=big_win,
-        min_fill_ratio=big_min_fill_ratio,
-        smooth_iters=big_smooth_iters,
-    )
-
     # fill은 "빈 픽셀"만 채우되, hit 기준으로 판단
     empty = ~hit
     if fill_mode != "none" and empty.sum() > 0:
@@ -144,4 +109,4 @@ def render_pointcloud_zbuffer(
         else:
             raise ValueError(f"Unknown fill_mode: {fill_mode}")
 
-    return (out, big, hit) if return_hit else (out, big) 
+    return (out, empty, hit) if return_hit else (out, empty) 

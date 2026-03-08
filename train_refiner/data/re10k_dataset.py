@@ -45,7 +45,7 @@ class ChunkCache:
             self.access_order.append(chunk_path_str)
             return self.cache[chunk_path_str]
         
-        chunk = torch.load(chunk_path, map_location="cpu")
+        chunk = torch.load(chunk_path, map_location="cpu", weights_only=False)
         
         if len(self.cache) >= self.max_size:
             oldest = self.access_order.pop(0)

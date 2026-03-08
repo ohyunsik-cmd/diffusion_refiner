@@ -441,7 +441,7 @@ print("Model loaded!")
 
 print("Loading samples from RE10K dataset...")
 
-for sample_num in range(50):
+for sample_num in range(10):
     chunk_idx = np.random.randint(0, 500)
     chunk_path = DATASET_ROOT / "train" / f"{chunk_idx:06d}.torch"
     data = load_chunk_sample(chunk_path, sample_idx=0)
@@ -604,8 +604,8 @@ for sample_num in range(50):
     # 5) Render to target (GT->Pred transformed pose)
     #rendered, mask= render_pointcloud_zbuffer(all_pts, all_col, w2c_tgt_in_pred, K_tgt, out_h, out_w)
     #rendered_from_predT, mask = render_pointcloud_zbuffer(all_pts, all_col, w2c_predT, K_predT, out_h, out_w)
-    rendered = simple_point_splatting(all_pts, all_col, w2c_tgt_in_pred, K_tgt, out_h, out_w)
-    rendered_from_predT = simple_point_splatting(all_pts, all_col, w2c_predT, K_predT, out_h, out_w)
+    rendered, big1 = render_pointcloud_zbuffer(all_pts, all_col, w2c_tgt_in_pred, K_tgt, out_h, out_w)
+    rendered_from_predT, big2 = render_pointcloud_zbuffer(all_pts, all_col, w2c_predT, K_predT, out_h, out_w)
     
     img = rendered  # [3,H,W]
     filled = (img.sum(0, keepdim=True) > 0).float()  # [1,H,W]
@@ -628,6 +628,7 @@ for sample_num in range(50):
     out_pred[:, filled_pred[0] == 0] = img2_pred[:, filled_pred[0] == 0]
     rendered_from_predT = out_pred
 
+    mask = big2.detach().cpu().numpy()    
     rendered_np = rendered.permute(1, 2, 0).detach().cpu().numpy().clip(0, 1)
     rendered_from_predT_np = rendered_from_predT.permute(1, 2, 0).detach().cpu().numpy().clip(0, 1)
 
@@ -640,7 +641,7 @@ for sample_num in range(50):
     axes[0].imshow(ctx0_np); axes[0].set_title("Context 0"); axes[0].axis("off")
     axes[1].imshow(ctx1_np); axes[1].set_title("Context 1"); axes[1].axis("off")
     axes[2].imshow(tgt_np);  axes[2].set_title("Target GT"); axes[2].axis("off")
-    axes[3].imshow(rendered_np); axes[3].set_title(f"Rendered image by GT pose"); axes[3].axis("off")
+    axes[3].imshow(mask); axes[3].set_title(f"Mask"); axes[3].axis("off")
     axes[4].imshow(rendered_from_predT_np); axes[4].set_title(f"Rendered image by Pred pose"); axes[4].axis("off")
     
 

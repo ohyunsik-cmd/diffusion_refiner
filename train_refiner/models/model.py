@@ -18,7 +18,6 @@ from .sd_turbo_masked import SDTurboMaskedConvIn
 
 def make_1step_sched():
     noise_scheduler_1step = DDPMScheduler.from_pretrained("stabilityai/sd-turbo", subfolder="scheduler")
-    noise_scheduler_1step.set_timesteps(1, device="cuda")
     noise_scheduler_1step.alphas_cumprod = noise_scheduler_1step.alphas_cumprod.cuda()
     return noise_scheduler_1step
 
@@ -136,12 +135,13 @@ def save_ckpt(net_difix, optimizer, outf):
 
 
 class Difix(torch.nn.Module):
-    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=999):
+    def __init__(self, pretrained_name=None, pretrained_path=None, ckpt_folder="checkpoints", lora_rank_vae=4, mv_unet=False, timestep=199):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer")
         self.text_encoder = CLIPTextModel.from_pretrained("stabilityai/sd-turbo", subfolder="text_encoder").cuda()
         self.sched = make_1step_sched()
-        
+        self.timestep = timestep
+        self.sched.set_timesteps(self.sched.config.num_train_timesteps, device="cuda")
 
         vae = AutoencoderKL.from_pretrained("stabilityai/sd-turbo", subfolder="vae")
         vae.encoder.forward = my_vae_encoder_fwd.__get__(vae.encoder, vae.encoder.__class__)
@@ -289,7 +289,7 @@ class Difix(torch.nn.Module):
         self.vae.decoder.skip_conv_4.requires_grad_(True)
         self.unet.conv_in.conv1_mask.requires_grad_(True)
 
-    def forward(self, x, mask=None, timesteps=None, prompt=None, prompt_tokens=None):
+    def forward(self, x, mask=None, prompt=None, prompt_tokens=None):
         # either the prompt or the prompt_tokens should be provided
         assert (prompt is None) != (prompt_tokens is None), "Either prompt or prompt_tokens should be provided"
         
@@ -319,21 +319,31 @@ class Difix(torch.nn.Module):
         else:
             self.unet.conv_in.current_mask = None
         
-        self.sched.set_timesteps(1, device="cuda")
-        t_fixed = self.sched.timesteps[0]
-        t_unet = t_fixed.expand(z.shape[0]) 
+        # timestep 선택
+        if self.timestep is None:
+            t_scalar = 199
+        elif isinstance(self.timestep, int):
+            t_scalar = self.timestep
+        elif isinstance(self.timestep, torch.Tensor):
+            if self.timestep.numel() != 1:
+                raise ValueError("Current implementation expects a single shared timestep for the whole batch.")
+            t_scalar = int(self.timestep.item())
+        else:
+            raise TypeError("timesteps must be None, int, or torch.Tensor")
+
+        t_unet = torch.full((z.shape[0],), t_scalar, device=z.device, dtype=torch.long)
         
         unet_input = z
         
         model_pred = self.unet(unet_input, t_unet, encoder_hidden_states=caption_enc,).sample
-        z_denoised = self.sched.step(model_pred, t_fixed, z, return_dict=True).prev_sample
+        z_denoised = self.sched.step(model_pred, t_scalar, z, return_dict=True).prev_sample
         self.vae.decoder.incoming_skip_acts = self.vae.encoder.current_down_blocks
         output_image = (self.vae.decode(z_denoised / self.vae.config.scaling_factor).sample).clamp(-1, 1)
         output_image = rearrange(output_image, '(b v) c h w -> b v c h w', v=num_views)
         
         return output_image
     
-    def sample(self, image, width, height, ref_image=None, timesteps=None, prompt=None, prompt_tokens=None):
+    def sample(self, image, width, height, ref_image=None, prompt=None, prompt_tokens=None):
         input_width, input_height = image.size
         new_width = image.width - image.width % 8
         new_height = image.height - image.height % 8
@@ -350,7 +360,7 @@ class Difix(torch.nn.Module):
             ref_image = ref_image.resize((new_width, new_height), Image.LANCZOS)
             x = torch.stack([T(image), T(ref_image)], dim=0).unsqueeze(0).cuda()
         
-        output_image = self.forward(x, timesteps, prompt, prompt_tokens)[:, 0]
+        output_image = self.forward(x, prompt=prompt, prompt_tokens=prompt_tokens)[:, 0]
         output_pil = transforms.ToPILImage()(output_image[0].cpu() * 0.5 + 0.5)
         output_pil = output_pil.resize((input_width, input_height), Image.LANCZOS)
         
